@@ -14,3 +14,6 @@ parameters:
     value: SSE
   - name: some-name
     value: other
+---
+name: test-module
+path: oci::011316101677.dkr.ecr.us-west-2.amazonaws.com/seedfarmer/test-module:v0.1.0//test-module

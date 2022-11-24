@@ -17,8 +17,12 @@ import hashlib
 import json
 import logging
 import os
+import re
+import requests
+import tarfile
 from typing import Any, Dict, List, Optional, cast
 from urllib.parse import parse_qs
+from rich import inspect
 
 import checksumdir
 import yaml
@@ -44,6 +48,7 @@ from seedfarmer.output_utils import (
     print_manifest_inventory,
     print_manifest_json,
 )
+from seedfarmer.services import boto3_client
 from seedfarmer.services.session_manager import SessionManager
 
 _logger: logging.Logger = logging.getLogger(__name__)
@@ -60,12 +65,12 @@ def _clone_module_repo(git_path: str) -> str:
     ----------
     git_path : str
         The Git URL specified in the Module Manifest. Full example:
-        https://example.com/network.git//modules/vpc?ref=v1.2.0&depth=1
+        git::https://example.com/network.git//modules/vpc?ref=v1.2.0&depth=1
 
     Returns
     -------
     str
-        The local directory within the codeseeder.out/ where the repository was cloned
+        The local directory within the seedfamer.gitmodules/ where the repository was cloned
     """
     git_path = git_path.replace("git::", "")
     ref: Optional[str] = None
@@ -95,6 +100,91 @@ def _clone_module_repo(git_path: str) -> str:
         _logger.debug("Pulling existing repo %s at %s: ref=%s", git_path, working_dir, ref)
         Repo(working_dir).remotes["origin"].pull()
 
+    return os.path.join(working_dir, module_directory)
+
+
+def _pull_oci_repo(oci_path: str) -> str:
+    """Pull an OCI image and extract the .tar.gz file
+
+    Parameters
+    ----------
+    oci_path : str
+        An OCI repository URI specified in the Module Manifest. Full example:
+        oci::public.ecr.aws/public-modules:v0.1.0//networking/
+
+    Returns
+    -------
+    str
+        The local directory within the seedfarmer.ocimodules/ where the repository was cloned
+    """
+    oci_path = oci_path.replace("oci::", "")
+    module_directory = ""
+
+    if "//" in oci_path:
+        oci_path, module_directory = oci_path.split("//")
+
+    if ":" not in oci_path:
+        raise ValueError("Invalid OCI repostiroy URI. An image tag is required: %s", oci_path)
+
+    repository, tag = oci_path.split(":")
+    repo_directory = oci_path.replace("/", "_").replace(":", "_")
+
+    working_dir = os.path.join(
+        config.OPS_ROOT, "seedfarmer.ocimodules", repo_directory
+    )
+    os.makedirs(working_dir, exist_ok=True)
+
+    if not os.listdir(working_dir):
+        _logger.debug("Pulling OCI image %s", oci_path)
+
+        local_ecr_pattern = r"^[0-9]{12}\.dkr\.ecr\..*\.amazonaws\.com/"
+        public_ecr_pattern = f"^public.ecr.aws/"
+
+        local_ecr_match = re.match(local_ecr_pattern, repository)
+        public_ecr_match = re.match(public_ecr_pattern, repository)
+
+        ecr_host = ""
+        headers = {}
+
+        if local_ecr_match:
+            ecr_host = local_ecr_match.group()
+            registry_id, _, _, region, _, _ = repository.split(".")
+            repository = re.sub(local_ecr_pattern, "", repository)
+
+            session = SessionManager().get_or_create().toolchain_session
+            ecr_client = boto3_client(service_name="ecr", session=session, region_name="us-east-1")
+            response = ecr_client.get_authorization_token(registryIds=[registry_id])
+            token = response["authorizationData"][0]["authorizationToken"]
+            headers={"Authorization": f"Basic {token}"}
+        elif public_ecr_match:
+            ecr_host = public_ecr_match.group()
+            repository = re.sub(public_ecr_pattern, "", repository)
+
+            session = SessionManager().get_or_create().toolchain_session
+            ecr_client = boto3_client(service_name="ecr-public", session=session, region_name=region)
+            response = ecr_client.get_authorization_token()
+            token = response["authorizationData"][0]["authorizationToken"]
+            headers={"Authorization": f"Bearer {token}"}
+        else:
+            raise ValueError("Invalid OCI repository URI. Unable to determine ECR public/private endpoint: %s", oci_path)
+
+        url = f"https://{ecr_host}v2/{repository}/manifests/{tag}"
+        _logger.debug("Retrieving OCI manifest at url: %s", url)
+        with requests.get(url=url, headers=headers) as manifest_response:
+            manifest = manifest_response.json()
+            if manifest.get("layers") and manifest["layers"][0]["mediaType"] == "application/vnd.awsce.seedfarmer.module.v1.tar+gzip":
+                digest = manifest["layers"][0]["digest"]
+            else:
+                raise Exception("Invalid OCI repository URI. Unable to process manifest: %s - %s", oci_path, manifest)
+
+        url = f"https://{ecr_host}v2/{repository}/blobs/{digest.replace(':', '%3A')}"
+        headers["Content-Type"] = "application/octet-stream"
+        _logger.debug("Retrieving OCI blob at url: %s", url)
+        with requests.get(url=url, headers=headers, stream=True) as blog_response:
+            tar_file = tarfile.open(fileobj=blog_response.raw)
+            tar_file.extractall(working_dir)
+    else:
+        _logger.debug("Skipping pull of OCI image as local cache directory exists: %s - %s", oci_path, working_dir)
     return os.path.join(working_dir, module_directory)
 
 
@@ -451,6 +541,7 @@ def deploy_deployment(
                 raise ValueError("Unable to parse module manifest, `path` not specified")
 
             module_path = _clone_module_repo(module.path) if module.path.startswith("git::") else module.path
+            module_path = _pull_oci_repo(module_path) if module_path.startswith("oci::") else module_path
 
             deployspec_path = get_deployspec_path(module_path)
             with open(deployspec_path) as module_spec_file:
