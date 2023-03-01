@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import botocore.exceptions
 from aws_codeseeder import EnvVar, codeseeder
@@ -33,9 +33,9 @@ from seedfarmer.utils import generate_session_hash
 _logger: logging.Logger = logging.getLogger(__name__)
 
 
-def _param(key: str) -> str:
+def _param(key: str, value: Union[str, EnvVar]) -> Dict[str, Union[str, EnvVar]]:
     p = config.PROJECT.upper().replace("-", "_")
-    return f"{p}_{key}"
+    return {f"{p}_{key}": value, f"SEEDFARMER_{key}": value}
 
 
 def _env_vars(
@@ -47,26 +47,24 @@ def _env_vars(
     docker_credentials_secret: Optional[str] = None,
     permissions_boundary_arn: Optional[str] = None,
     session: Optional[Session] = None,
-) -> Dict[str, str]:
-    env_vars = (
-        {
-            f"{_param('PARAMETER')}_{p.upper_snake_case}": p.value
-            if isinstance(p.value, str) or isinstance(p.value, EnvVar)
-            else json.dumps(p.value)
-            for p in parameters
-        }
-        if parameters
-        else {}
-    )
+) -> Dict[str, Union[str, EnvVar]]:
+    env_vars = {}
+    for p in parameters if parameters else []:
+        value = p.value if isinstance(p.value, str) or isinstance(p.value, EnvVar) else json.dumps(p.value)
+        env_vars = {**env_vars, **(_env_vars(f"PARAMETER_{p.upper_snake_case}", value))}
+
     _logger.debug(f"env_vars: {env_vars}")
-    env_vars[_param("DEPLOYMENT_NAME")] = deployment_name
-    env_vars[_param("MODULE_METADATA")] = module_metadata if module_metadata is not None else ""
-    env_vars[_param("MODULE_NAME")] = f"{group_name}-{module_manifest_name}"
-    env_vars[_param("HASH")] = generate_session_hash(session=session)
+    env_vars = {
+        **env_vars,
+        **(_param("DEPLOYMENT_NAME", deployment_name)),
+        **(_param("MODULE_METADATA", module_metadata if module_metadata is not None else "")),
+        **(_param("MODULE_NAME", f"{group_name}-{module_manifest_name}")),
+        **(_param("HASH", generate_session_hash(session=session))),
+    }
     if docker_credentials_secret:
         env_vars["AWS_CODESEEDER_DOCKER_SECRET"] = docker_credentials_secret
     if permissions_boundary_arn:
-        env_vars[_param("PERMISSIONS_BOUNDARY_ARN")] = permissions_boundary_arn
+        env_vars = {**env_vars, **(_param("PERMISSIONS_BOUNDARY_ARN", permissions_boundary_arn))}
     return env_vars
 
 
@@ -93,7 +91,10 @@ def deploy_module(
         permissions_boundary_arn=permissions_boundary_arn,
         session=SessionManager().get_or_create().get_deployment_session(account_id=account_id, region_name=region),
     )
-    env_vars[_param("MODULE_MD5")] = module_manifest.bundle_md5 if module_manifest.bundle_md5 is not None else ""
+    env_vars = {
+        **env_vars,
+        **(_param("MODULE_MD5", module_manifest.bundle_md5 if module_manifest.bundle_md5 is not None else "")),
+    }
 
     md5_put = [
         (
@@ -101,7 +102,8 @@ def deploy_module(
             f"-g {group_name} -m {module_manifest.name} -t bundle --debug ;"
         )
     ]
-    pmd = _param("MODULE_METADATA")
+    # TODO: Still need to determine which metadata value to store
+    pmd = _param("MODULE_METADATA", "").keys()
     metadata_put = [
         f"if [[ -f {pmd} ]]; then export {pmd}=$(cat {pmd}); fi",
         (
@@ -241,7 +243,7 @@ def _execute_module_commands(
     extra_pre_build_commands: Optional[List[str]] = None,
     extra_build_commands: Optional[List[str]] = None,
     extra_post_build_commands: Optional[List[str]] = None,
-    extra_env_vars: Optional[Dict[str, Any]] = None,
+    extra_env_vars: Optional[Dict[str, Union[str, EnvVar]]] = None,
     codebuild_compute_type: Optional[str] = None,
     codebuild_role_name: Optional[str] = None,
     codebuild_image: Optional[str] = None,
@@ -263,7 +265,7 @@ def _execute_module_commands(
         extra_build_commands=extra_build_commands,
         extra_post_build_commands=extra_post_build_commands,
         extra_env_vars=extra_env_vars,
-        extra_exported_env_vars=[f"{_param('MODULE_METADATA')}"],
+        extra_exported_env_vars=_param("MODULE_METADATA", "").keys(),
         codebuild_role=codebuild_role_name,
         codebuild_image=codebuild_image,
         bundle_id=f"{deployment_name}-{group_name}-{module_manifest_name}",
@@ -282,7 +284,7 @@ def _execute_module_commands(
         extra_pre_build_commands: Optional[List[str]] = None,
         extra_build_commands: Optional[List[str]] = None,
         extra_post_build_commands: Optional[List[str]] = None,
-        extra_env_vars: Optional[Dict[str, Any]] = None,
+        extra_env_vars: Optional[Dict[str, Union[str, EnvVar]]] = None,
         codebuild_compute_type: Optional[str] = None,
     ) -> str:
         deploy_info = {
